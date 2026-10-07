@@ -1,0 +1,10 @@
+[project]
+name = "guanaco"
+version = "0.1.0"
+description = "Global-uniformity evaluation of conjunctive queries"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
