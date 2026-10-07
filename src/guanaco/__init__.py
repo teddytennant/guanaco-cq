@@ -1,11 +1,35 @@
-"""Guanaco: global-uniformity evaluation of conjunctive queries.
+"""Guanaco conjunctive-query evaluation core."""
 
-Implements Algorithms 1 to 3 of Abo Khamis and Chen, arXiv:2610.05440.
-"""
+from guanaco.algo import (
+    Configuration,
+    avg_degree,
+    cleanup,
+    establish_pi_consistency,
+    guanaco,
+    is_clean,
+    is_empty,
+    is_pi_consistent,
+    is_realizable_pair,
+    is_uniform,
+    log_base_m,
+    max_degree,
+    parameters,
+    realize_pair,
+)
 
-from .cleanup import cleanup
-from .config import Configuration, answers
-from .eval import guanaco
-from .subw import subw
-
-__all__ = ["Configuration", "answers", "cleanup", "guanaco", "subw"]
+__all__ = [
+    "Configuration",
+    "avg_degree",
+    "cleanup",
+    "establish_pi_consistency",
+    "guanaco",
+    "is_clean",
+    "is_empty",
+    "is_pi_consistent",
+    "is_realizable_pair",
+    "is_uniform",
+    "log_base_m",
+    "max_degree",
+    "parameters",
+    "realize_pair",
+]

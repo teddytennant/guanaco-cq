@@ -1,121 +1,249 @@
-"""Correctness tests for Guanaco against an independent nested-loop oracle."""
+"""Tests for the Guanaco core. Expected answers come from a local join."""
 
-import itertools
-
-from guanaco import Configuration, answers, guanaco, subw
-from guanaco.cleanup import cleanup
-from guanaco.consistency import is_pi_consistent
-
-
-def oracle(config, free=None):
-    """Enumerate the product of per-variable domains and keep full answers."""
-    domains = {v: set() for v in config.variables}
-    for scope, rel in config.relations.items():
-        for item in rel:
-            for v, val in item:
-                domains[v].add(val)
-    variables = sorted(config.variables)
-    found = []
-    for combo in itertools.product(*[sorted(domains[v]) for v in variables]):
-        mapping = dict(zip(variables, combo))
-        if all(
-            tuple(sorted((v, mapping[v]) for v in scope)) in rel
-            for scope, rel in config.relations.items()
-        ):
-            found.append(mapping)
-    if free is None:
-        return found
-    seen = set()
-    out = []
-    for row in found:
-        item = tuple(sorted((v, row[v]) for v in free))
-        if item not in seen:
-            seen.add(item)
-            out.append(dict(item))
-    return out
+from guanaco import (
+    Configuration,
+    cleanup,
+    establish_pi_consistency,
+    guanaco,
+    is_clean,
+    is_pi_consistent,
+    parameters,
+    realize_pair,
+)
 
 
-def as_set(rows, variables):
-    return {tuple(row[v] for v in variables) for row in rows}
+def brute_force(relations, free):
+    """Join relations and project onto free. Independent of the library.
+
+    relations: sequence of (variable schema, sequence of value tuples).
+    free: variables to keep. Empty free is the Boolean case: the result is
+    {empty assignment} when the join is non-empty, else the empty set.
+    """
+    parsed = []
+    for schema, tuples in relations:
+        schema = tuple(schema)
+        rows = [dict(zip(schema, tup)) for tup in tuples]
+        parsed.append(rows)
+    free = tuple(free)
+    found = set()
+
+    def rec(index, assignment):
+        if index == len(parsed):
+            if not free:
+                found.add(frozenset())
+            elif all(variable in assignment for variable in free):
+                found.add(frozenset((variable, assignment[variable]) for variable in free))
+            return
+        for row in parsed[index]:
+            if any(assignment.get(variable, value) != value for variable, value in row.items()):
+                continue
+            merged = dict(assignment)
+            merged.update(row)
+            rec(index + 1, merged)
+
+    rec(0, {})
+    return found
 
 
-def test_single_edge_width_and_answers():
-    # One edge: every tree decomposition has that edge as a bag, g(edge) <= 1,
-    # so subw = 1.
-    assert subw({"x", "y"}, [{"x", "y"}]) == 1.0
-    c = Configuration(frozenset({"x", "y"}))
-    c.add_relation(("x", "y"), [(1, 2), (1, 3), (4, 5)])
-    got = guanaco(c)
-    assert as_set(got, ("x", "y")) == as_set(oracle(c), ("x", "y"))
+def brute_config(config, free):
+    """Join every relation stored on a configuration object."""
+    relations = []
+    for schema, tuples in config.relations.items():
+        ordered = tuple(sorted(schema, key=str))
+        rows = []
+        for assignment in tuples:
+            mapping = dict(assignment)
+            rows.append(tuple(mapping[variable] for variable in ordered))
+        relations.append((ordered, rows))
+    return brute_force(relations, free)
 
 
-def test_path_of_two_edges_matches_oracle():
-    # A tree: bags can be the edges themselves, subw = 1.
-    assert subw({"x", "y", "z"}, [{"x", "y"}, {"y", "z"}]) == 1.0
-    c = Configuration(frozenset({"x", "y", "z"}))
-    c.add_relation(("x", "y"), [(1, 2), (1, 3), (4, 2)])
-    c.add_relation(("y", "z"), [(2, 5), (2, 6), (3, 5)])
-    got = guanaco(c)
-    assert as_set(got, ("x", "y", "z")) == as_set(oracle(c), ("x", "y", "z"))
-    assert len(got) == len(as_set(got, ("x", "y", "z")))
+def assignment(pairs):
+    return frozenset(pairs)
 
 
-def test_triangle_width_and_answers():
-    # A triangle has no tree decomposition whose bags all sit inside an edge:
-    # any cover of the three edges needs a bag, and connectedness forces some
-    # bag to hold two non-adjacent... actually a triangle's edges pairwise
-    # share a vertex, so bags = the three edges IS a tree decomposition, and
-    # every bag is an edge, so subw = 1. The 4-cycle is the 1.5 case.
-    assert subw({"x", "y", "z"}, [{"x", "y"}, {"y", "z"}, {"x", "z"}]) == 1.0
-    c = Configuration(frozenset({"x", "y", "z"}))
-    c.add_relation(("x", "y"), [(1, 1), (1, 2), (2, 2)])
-    c.add_relation(("y", "z"), [(1, 3), (2, 3), (2, 4)])
-    c.add_relation(("x", "z"), [(1, 3), (2, 4)])
-    got = guanaco(c)
-    assert as_set(got, ("x", "y", "z")) == as_set(oracle(c), ("x", "y", "z"))
+def test_pi_consistency_removes_dangling_tuple_and_preserves_answers():
+    relations = {
+        ("X", "Y"): [(0, 0), (1, 2)],
+        ("Y", "Z"): [(0, 1)],
+    }
+    config = Configuration(["X", "Y", "Z"], relations)
+    expected = brute_force(
+        [(("X", "Y"), relations[("X", "Y")]), (("Y", "Z"), relations[("Y", "Z")])],
+        ["X", "Y", "Z"],
+    )
+    assert expected == {assignment([("X", 0), ("Y", 0), ("Z", 1)])}
+
+    reduced = establish_pi_consistency(config)
+    assert is_pi_consistent(reduced)
+    xy = reduced.relations[frozenset({"X", "Y"})]
+    assert assignment([("X", 1), ("Y", 2)]) not in xy
+    assert assignment([("X", 0), ("Y", 0)]) in xy
+    assert brute_config(reduced, ["X", "Y", "Z"]) == expected
 
 
-def test_four_cycle_width_and_projection():
-    # C4: edges {x,y}, {y,z}, {z,w}, {w,x}. Every tree decomposition has a bag
-    # containing two non-adjacent vertices (otherwise the cycle is not covered
-    # while staying connected), and the polymatroid g(e) = 1 on edges and
-    # g({x,z}) = g({y,w}) = 1.5 is edge-dominated, so subw = 1.5.
-    edges = [{"x", "y"}, {"y", "z"}, {"z", "w"}, {"w", "x"}]
-    assert subw({"x", "y", "z", "w"}, edges) == 1.5
-    c = Configuration(frozenset({"x", "y", "z", "w"}))
-    c.add_relation(("x", "y"), [(1, 1), (1, 2), (2, 2)])
-    c.add_relation(("y", "z"), [(1, 3), (2, 3), (2, 4)])
-    c.add_relation(("z", "w"), [(3, 5), (3, 6), (4, 6)])
-    c.add_relation(("w", "x"), [(5, 1), (6, 1), (6, 2)])
-    got = guanaco(c, free=("x", "z"))
-    assert as_set(got, ("x", "z")) == as_set(oracle(c, free=("x", "z")), ("x", "z"))
+def test_cleanup_on_skewed_relation_preserves_answers_and_is_clean():
+    rows = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (2, 0), (3, 0)]
+    config = Configuration(["X", "Y"], {("X", "Y"): rows})
+    base = 7
+    eps = 0.25
+    leaves = cleanup(base, config, eps)
+    assert len(leaves) > 1
+    expected = brute_force([(("X", "Y"), rows)], ["X", "Y"])
+    union = set()
+    for leaf in leaves:
+        assert is_clean(leaf, base, eps)
+        union |= brute_config(leaf, ["X", "Y"])
+    assert union == expected
 
 
-def test_no_answer_returns_empty():
-    # R says x is 1 or 2; S says x is 3. No mapping satisfies both.
-    c2 = Configuration(frozenset({"x", "y"}))
-    c2.add_relation(("x",), [(1,), (2,)])
-    c2.add_relation(("x", "y"), [(3, 4)])
-    assert guanaco(c2) == []
-    assert oracle(c2) == []
+def test_realize_pair_equals_pairwise_join():
+    left_rows = [(0, 1), (0, 2), (1, 2)]
+    right_rows = [(1, 3), (2, 4), (2, 5), (9, 9)]
+    config = Configuration(
+        ["X", "Y", "Z"],
+        {("X", "Y"): left_rows, ("Y", "Z"): right_rows},
+    )
+    realized = realize_pair(config, {"X", "Y"}, {"Y", "Z"})
+    got = realized.relations[frozenset({"X", "Y", "Z"})]
+    expected = set()
+    for x_val, y_val in left_rows:
+        for y_other, z_val in right_rows:
+            if y_val == y_other:
+                expected.add(assignment([("X", x_val), ("Y", y_val), ("Z", z_val)]))
+    assert got == expected
+    assert realized.relations[frozenset({"X", "Y"})] == config.relations[frozenset({"X", "Y"})]
 
 
-def test_cleanup_is_uniform_and_represents():
-    c = Configuration(frozenset({"x", "y"}))
-    c.add_relation(("x", "y"), [(1, 1), (1, 2), (1, 3), (1, 4), (2, 5)])
-    parts = cleanup(5, c.copy(), 0.5)
-    assert parts
-    assert all(is_pi_consistent(p) for p in parts)
-    joined = set()
-    for part in parts:
-        for row in answers(part):
-            joined.add((row["x"], row["y"]))
-    assert joined == as_set(oracle(c), ("x", "y"))
+def _cycle(r_rows, s_rows, t_rows, u_rows):
+    relations = {
+        ("X", "Y"): r_rows,
+        ("Y", "Z"): s_rows,
+        ("Z", "W"): t_rows,
+        ("W", "X"): u_rows,
+    }
+    config = Configuration(["X", "Y", "Z", "W"], relations)
+    hypergraph = [("X", "Y"), ("Y", "Z"), ("Z", "W"), ("W", "X")]
+    return hypergraph, config, relations
 
 
-def test_answers_are_unique():
-    c = Configuration(frozenset({"x", "y", "z"}))
-    c.add_relation(("x", "y"), [(1, 1), (1, 1)])
-    c.add_relation(("y", "z"), [(1, 2), (1, 3)])
-    got = guanaco(c)
-    assert len(got) == len(as_set(got, ("x", "y", "z"))) == 2
+def _run_cycle(r_rows, s_rows, t_rows, u_rows, free=("X",)):
+    hypergraph, config, relations = _cycle(r_rows, s_rows, t_rows, u_rows)
+    expected = brute_force(
+        [
+            (("X", "Y"), relations[("X", "Y")]),
+            (("Y", "Z"), relations[("Y", "Z")]),
+            (("Z", "W"), relations[("Z", "W")]),
+            (("W", "X"), relations[("W", "X")]),
+        ],
+        free,
+    )
+    got = guanaco(hypergraph, free, 0.5, config, 1.5)
+    return got, expected, config
+
+
+def test_four_cycle_satisfying():
+    got, expected, _config = _run_cycle(
+        [(0, 1)],
+        [(1, 2)],
+        [(2, 3)],
+        [(3, 0)],
+        free=(),
+    )
+    assert expected == {frozenset()}
+    assert got == expected
+
+
+def test_four_cycle_unsatisfying():
+    # Locally consistent 4-cycle with no global answer.
+    got, expected, _config = _run_cycle(
+        [(0, 1), (1, 0)],
+        [(1, 0), (0, 1)],
+        [(0, 1), (1, 0)],
+        [(0, 0), (1, 1)],
+        free=(),
+    )
+    assert expected == set()
+    assert got == expected
+
+
+def _skewed_rows(width=3):
+    rows = [(value, 0) for value in range(width)]
+    rows += [(0, value) for value in range(1, width)]
+    return rows
+
+
+def test_four_cycle_skewed_splits_and_matches_brute_force():
+    rows = _skewed_rows(3)
+    hypergraph, config, relations = _cycle(rows, rows, rows, rows)
+    expected = brute_force(
+        [
+            (("X", "Y"), relations[("X", "Y")]),
+            (("Y", "Z"), relations[("Y", "Z")]),
+            (("Z", "W"), relations[("Z", "W")]),
+            (("W", "X"), relations[("W", "X")]),
+        ],
+        (),
+    )
+    # Hand-checked cycle: X=1, Y=0, Z=1, W=0.
+    assert frozenset() in expected
+    base, eps, _w_plus = parameters(config, 0.5, 1.5)
+    leaves = cleanup(base, config, eps)
+    assert len(leaves) > 1
+    for leaf in leaves:
+        assert is_clean(leaf, base, eps)
+    got = guanaco(hypergraph, (), 0.5, config, 1.5)
+    assert got == expected
+
+
+def test_acyclic_two_relation_query_matches_brute_force():
+    relations = {
+        ("X", "Y"): [(0, 1), (1, 1), (2, 2), (3, 4)],
+        ("Y", "Z"): [(1, 5), (1, 6), (2, 7), (8, 8)],
+    }
+    config = Configuration(["X", "Y", "Z"], relations)
+    hypergraph = [("X", "Y"), ("Y", "Z")]
+    expected = brute_force(
+        [(("X", "Y"), relations[("X", "Y")]), (("Y", "Z"), relations[("Y", "Z")])],
+        (),
+    )
+    assert expected == {frozenset()}
+    got = guanaco(hypergraph, (), 0.5, config, 1.0)
+    assert got == expected
+
+    empty_rel = {
+        ("X", "Y"): [(0, 1)],
+        ("Y", "Z"): [(2, 3)],
+    }
+    empty_config = Configuration(["X", "Y", "Z"], empty_rel)
+    empty_expected = brute_force(
+        [(("X", "Y"), empty_rel[("X", "Y")]), (("Y", "Z"), empty_rel[("Y", "Z")])],
+        (),
+    )
+    assert empty_expected == set()
+    assert guanaco(hypergraph, (), 0.5, empty_config, 1.0) == empty_expected
+
+
+def test_free_set_projection_is_duplicate_free():
+    relations = {
+        ("X", "Y"): [(0, 1), (0, 2), (1, 2), (2, 3)],
+        ("Y", "Z"): [(1, 5), (2, 6), (2, 7), (3, 8), (9, 9)],
+    }
+    config = Configuration(["X", "Y", "Z"], relations)
+    hypergraph = [("X", "Y"), ("Y", "Z")]
+    free = ["X"]
+    expected = brute_force(
+        [(("X", "Y"), relations[("X", "Y")]), (("Y", "Z"), relations[("Y", "Z")])],
+        free,
+    )
+    # X=0 via Y=1 and via Y=2, so a bag join could emit X=0 twice.
+    assert expected == {
+        assignment([("X", 0)]),
+        assignment([("X", 1)]),
+        assignment([("X", 2)]),
+    }
+    got = guanaco(hypergraph, free, 0.5, config, 1.0)
+    assert got == expected
+    assert len(got) == len(set(got))
+    for answer in got:
+        assert {variable for variable, _value in answer} <= set(free)
